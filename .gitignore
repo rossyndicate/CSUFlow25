@@ -2,5 +2,11 @@
 .Rhistory
 .RData
 .Ruserdata
-data/
 **.DS_Store
+data/fill_rasters
+data/filledareas
+data/flowdir_rasters
+data/flowline_rasters
+data/NHDPlusDEM
+data/temp
+data/

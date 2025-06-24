@@ -1,0 +1,230 @@
+---
+title: "ModelDev-WatershedDelineation"
+author: "Katie Willi"
+date: "2025-05-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(caret)
+library(terra)
+library(elevatr)
+library(dataRetrieval)
+library(nhdplusTools)
+library(StreamCatTools)
+library(tmap)
+library(climateR)
+library(data.table)
+library(mapview)
+list.files("src/", full.names = TRUE) %>% walk(~source(.))
+```
+
+Stephanie's final list of gages:
+
+```{r}
+stephanie_list <- readr::read_csv("data/dataset.csv")
+
+comid_var <- read_csv("data/watersheds_with_vars_20250424.csv") %>%
+  select(site_no, comid) %>%
+  st_drop_geometry()
+
+watersheds <- sf::st_read("data/watersheds_20250507.shp") %>%
+  dplyr::select(site_no,
+                old_st_) %>%
+  dplyr::left_join(comid_var, by = "site_no")
+```
+
+
+```{r}
+stephanie_p1 <- stephanie_list %>%
+  filter(!is.na(cdwr_id)) %>%
+  dplyr::inner_join(., watersheds %>% dplyr::select(cdwr_id = site_no, comid, geometry), by = "cdwr_id") 
+
+stephanie_p2 <- stephanie_list %>%
+  filter(!is.na(cdwr_id)) %>%
+  dplyr::inner_join(., dplyr::select(watersheds, cdwr_id = old_st_, comid, geometry), by = "cdwr_id") 
+
+stephanie_p3 <- stephanie_list %>%
+  filter(!is.na(usgs_id)) %>%
+  dplyr::inner_join(., dplyr::select(watersheds, usgs_id = site_no, comid, geometry), by = "usgs_id") 
+
+stephanie_p4 <- stephanie_list %>%
+  filter(!is.na(cdwr_id)) %>%
+  dplyr::inner_join(., dplyr::select(watersheds, usgs_id = old_st_, comid, geometry), by = "usgs_id") 
+
+complete_stephanie <- stephanie_p1 %>%
+  bind_rows(stephanie_p2) %>%
+  bind_rows(stephanie_p3) %>%
+  bind_rows(stephanie_p4) %>%
+  distinct() %>%
+  select(usgs_id, cdwr_id, name, class, comments, comid, geometry) %>%
+  st_as_sf()
+
+cb <- readRDS("data/EAST_RIVER.RDS") %>% mutate(usgs_id = "09112200", cdwr_id = "EASCEMCO", name = "East River Below Cement Creek Nr Crested Butte, CO", class = "within_basin_modification", comments = "irrigaion", comid = 1333206) %>% select(-watershed) %>% st_make_valid() %>%
+  st_transform(crs(complete_stephanie))
+
+complete_stephanie <- complete_stephanie %>%
+  filter(name != "East River Below Cement Creek Nr Crested Butte, CO") %>%
+  bind_rows(cb)
+
+saveRDS(complete_stephanie, "data/complete_stephanie.RDS")
+
+complete_stephanie <- complete_stephanie %>%
+  rowid_to_column(var = "site_no")
+
+rm(cb, comid_var, stephanie_list, stephanie_p1, stephanie_p2, stephanie_p3,
+   stephanie_p4, watersheds)
+```
+
+Confirm the watersheds are correct by reviewing each one:
+
+```{r, eval = FALSE}
+mapviewOptions(basemaps = "OpenTopoMap")
+
+# Loop through each watershed interactively
+for (i in 61:nrow(complete_stephanie)) {
+  
+  nhd <- get_nhdplus(AOI = complete_stephanie[i,])
+  
+  if(is.null(nrow(nhd))){
+    name <- complete_stephanie$name[i]
+    cat("\nShowing:", name, "\nPress [Enter] to continue...")
+    print(mapview(complete_stephanie[i, ], layer.name = name))
+    invisible(readline())
+  } else {
+    name <- complete_stephanie$name[i]
+    cat("\nShowing:", name, "\nPress [Enter] to continue...")
+    print(mapview(complete_stephanie[i, ], layer.name = name) + nhd)
+    invisible(readline())
+  }
+}
+```
+
+They are! Start getting predictor variables across each watershed. 
+
+##### STATSGO data from StreamCate
+
+```{r}
+selected_vars <- c(
+  # Soil, STATSGO variables:
+  "Clay", "Sand", "Rckdep", "WtDep", "Perm") %>% 
+  tolower()
+
+streamcat_sim <- complete_stephanie %>%
+  simple_streamcat_data(.) %>%
+  mutate(across(where(is.numeric), ~ifelse(is.nan(.), 0, .))) %>%
+  mutate(across(where(is.numeric), ~ifelse(. < 0, 0, .))) %>%
+  st_drop_geometry() %>%
+  rename_with(~ paste0(., "_streamcat"), -site_no)  %>%
+  select(-c(comid_streamcat, usgs_id_streamcat, cdwr_id_streamcat,
+            name_streamcat, class_streamcat, comments_streamcat))
+```
+
+##### Aspect features
+
+Dominant aspect requires a bit of a wonky workflow - I'm not quite sure if there's an easier approach than what I'm presenting here. I grab raw elevation DEMs, get the aspect (in degrees) for each grid cell, then convert those raw aspects (in degrees) into categorical N, E, S, W cardinal directions.
+
+```{r, eval = FALSE}
+watersheds_aspects <- complete_stephanie %>%
+  aspect_grabber(.) %>%
+  select(-c(comid, usgs_id, cdwr_id, name, class, comments)) %>% 
+  st_drop_geometry() 
+write_csv(watersheds_aspects, "data/watershed_aspects.csv")
+```
+
+##### Snow persistence
+
+Here I am loading in all the snow persistence data I downloaded from: https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930. There is annual snow persistence data from 2001-2020. Using the {terra} package, I get the area-weighted annual average snow persistence value for each watershed, then average each year's data together to get a single time- and area-weighted average for each watershed.
+
+```{r}
+watersheds_sp <- complete_stephanie %>%
+  snow_persistence_grabber(.) %>%
+  select(-c(comid, usgs_id, cdwr_id, name, class, comments)) %>% 
+  st_drop_geometry()
+```
+
+##### Daymet variables
+
+```{r}
+watersheds_daymet <- complete_stephanie %>%
+  daymet_grabber(.) %>%
+  select(-c(comid, usgs_id, cdwr_id, name, class, comments)) %>% 
+  st_drop_geometry()
+```
+
+##### Geology variables
+
+```{r}
+watersheds_geology <- complete_stephanie %>%
+  geology_grabber(.) %>%
+  select(-c(comid)) %>% 
+  st_drop_geometry()
+```
+
+##### Dam variables
+
+```{r}
+watersheds_dams <- complete_stephanie %>%
+  dam_grabber(.) %>%
+  select(-c(comid)) %>% 
+  st_drop_geometry()
+```
+
+##### NLCD variables
+
+```{r}
+watersheds_nlcd <- complete_stephanie %>%
+  nlcd_grabber(.)
+write_csv(watersheds_nlcd, "data/watersheds_nlcd.csv")
+```
+
+# Road density
+```{r}
+watersheds_roads <- complete_stephanie %>%
+  road_density_grabber() %>%
+  select(site_no, road_density_km_per_km2) %>%
+  st_drop_geometry()
+```
+
+#### Bind all together:
+```{r}
+watersheds_with_vars <- complete_stephanie %>%
+  mutate(ws_area_sqkm = as.numeric(st_area(.)/1000000)) %>%
+  left_join(watersheds_aspects, by = "site_no") %>%
+  left_join(watersheds_daymet, by = "site_no") %>%
+  left_join(watersheds_sp %>% select(-c(usgs_id, cdwr_id, name, class, comments)), by = "site_no") %>%
+  left_join(watersheds_geology %>% select(-c(usgs_id, cdwr_id, name, class, comments)), by = "site_no") %>%
+  left_join(watersheds_dams %>% select(-c(usgs_id, cdwr_id, name, class, comments)), by = "site_no")  %>%
+  left_join(watersheds_nlcd %>% select(-c(comid, usgs_id, cdwr_id, name, class, comments, geometry)) %>% st_drop_geometry(), by = "site_no") %>%
+  left_join(watersheds_roads, by = "site_no") %>%
+  left_join(streamcat_sim, by = "site_no") %>%
+  rename(index = site_no)
+
+write_csv(watersheds_with_vars, "data/watersheds_with_vars_20250509.csv")
+st_write(watersheds_with_vars %>% select(index, usgs_id, cdwr_id), "data/watersheds_shapefile.shp")
+```
+
+##### Remove correlated variables
+
+```{r}
+predictors <- read_csv("data/watersheds_with_vars_20250509.csv") %>%
+  # subset dataset to predictor vars:
+  select(8:ncol(.), -dominant_aspect)
+
+corr_matrix <- cor(predictors, use = 'pairwise.complete.obs')
+corr_matrix[is.na(corr_matrix)] <- 0 # replace NAs with zeros
+
+highly_corr_list <- caret::findCorrelation(corr_matrix, cutoff = 0.80, verbose = FALSE, names = TRUE, exact = TRUE) %>%
+  sort()
+
+predictors_corr_removed <-  read_csv("data/watersheds_with_vars_20250509.csv") %>%
+  dplyr::select(., -c(highly_corr_list))
+write_csv(predictors_corr_removed, "data/watersheds_corr_removed_20250512.csv")
+```
+
