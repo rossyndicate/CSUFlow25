@@ -1,20 +1,22 @@
-simple_streamcat_data <- function(df){
-
-  selected_vars <- c(
-    # Soil, STATSGO variables:
-    "Clay", "Sand", "Rckdep", "WtDep", "Perm") %>% 
-    tolower()
+direct_streamcat_data <- function(df){
   
-streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(selected_vars, collapse = ","),
-                                              aoi = 'watershed',
-                                              showAreaSqKm = TRUE,
-                                              comid = df$comid) %>%
-  # remove variables we don't particularly care about that get returned:
-  select(-contains("areasqkm"))
-
-streamcat_list_simple <- df %>%
-  left_join(., streamcat_vars, by = "comid")
-
+  # data.table::fread("data/COLORADO_SOIL_STREAMCAT.csv")
+  # 
+  # selected_vars <- c(
+  #   # Soil, STATSGO variables:
+  #   "Clay", "Sand", "Rckdep", "WtDep", "Perm") %>% 
+  #   tolower()
+  # 
+  # streamcat_vars <- StreamCatTools::sc_get_data(metric = paste(selected_vars, collapse = ","),
+  #                                               aoi = 'watershed',
+  #                                               showAreaSqKm = TRUE,
+  #                                               comid = df$comid) %>%
+  #   # remove variables we don't particularly care about that get returned:
+  #   select(-contains("areasqkm"))
+  
+  streamcat_list_simple <- df %>%
+    left_join(.,  data.table::fread("data/COLORADO_SOIL_STREAMCAT.csv"), by = "comid")
+  
   return(streamcat_list_simple)
 }
 # colorado <- tigris::states() %>% filter(STUSPS == "CO")

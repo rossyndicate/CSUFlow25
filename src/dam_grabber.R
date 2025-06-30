@@ -35,7 +35,7 @@ dam_grabber <- function(watersheds){
      
      # Store results for this watershed
      dam_stats[[i]] <- data.frame(
-       site_no = watershed$site_no,
+       index = watershed$index,
        damdensws_nid = dam_density,
        damnidstorws_nid = nid_storage,
        damnrmstorws_nid = normal_storage
@@ -52,7 +52,8 @@ dam_grabber <- function(watersheds){
    
    # Join with original watersheds data
    watersheds_with_dams <- watersheds %>%
-     left_join(dam_stats_df, by = "site_no")
+     select(index) %>%
+     left_join(dam_stats_df, by = "index")
    
    return(watersheds_with_dams)
  }

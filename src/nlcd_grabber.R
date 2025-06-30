@@ -1,8 +1,26 @@
 nlcd_grabber <- function(watersheds) {
 
-  # Load NLCD raster and crop to watershed extent
-  nlcd_raw <- terra::rast("data/nlcd/Annual_NLCD_LndCov_2019_CU_C1V0.tif")
-  imper_raw <- terra::rast("data/nlcd/Annual_NLCD_FctImp_2019_CU_C1V0.tif")
+  # # Load NLCD raster and crop to watershed extent
+  # nlcd_raw <- terra::rast("data/nlcd/Annual_NLCD_LndCov_2019_CU_C1V0.tif")
+  # imper_raw <- terra::rast("data/nlcd/Annual_NLCD_FctImp_2019_CU_C1V0.tif")
+
+  # proj_ws <- st_transform(polys_single, st_crs(nlcd_raw))
+  # 
+  # nlcd_crop <- crop(nlcd_raw, proj_ws, mask = TRUE)
+  # 
+  # terra::writeRaster(
+  #   nlcd_crop,
+  #   filename = "data/masked_nlcd_2019.tif", 
+  #   overwrite = TRUE
+  # )
+  # 
+  # imp_crop <- crop(imper_raw, proj_ws, mask = TRUE)
+  # 
+  # terra::writeRaster(
+  #   imp_crop,
+  #   filename = "data/masked_imper_2019.tif", 
+  #   overwrite = TRUE
+  # )
   
   # crs(nlcd_raw) <- "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
 
@@ -17,6 +35,11 @@ nlcd_grabber <- function(watersheds) {
   #       AUTHORITY["EPSG","9122"]],
   #   AUTHORITY["EPSG","4326"]]'
 
+  nlcd_raw <- terra::rast("data/masked_nlcd_2019.tif")
+  imper_raw <- terra::rast("data/masked_imper_2019.tif")
+  
+  
+  
   original <- watersheds
 
   # ensure both datasets have the same CRS
@@ -60,7 +83,7 @@ nlcd_grabber <- function(watersheds) {
   
   # Combine results into a data frame
   results <- data.frame(
-    original,
+    original %>% select(index),
     #Watershed_ID = watersheds[,1],
     Forest_Percent = forest_pct[,1],
     Grassland_Percent = grassland_pct[,1],
@@ -71,4 +94,4 @@ nlcd_grabber <- function(watersheds) {
 
   return(results)
 
-  }
+}

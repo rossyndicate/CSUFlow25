@@ -1,0 +1,12 @@
+name: CSUFlow25
+title: CSUFlow25
+username: geocentroid
+account: geocentroid
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 15001256
+bundleId: 10531747
+url: https://geocentroid.shinyapps.io/CSUFlow25/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE

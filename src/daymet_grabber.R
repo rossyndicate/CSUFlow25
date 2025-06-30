@@ -1,5 +1,41 @@
 daymet_grabber <- function(watersheds){
   
+  # swe_stack <- terra::rast(list.files("data/daymet/", pattern = "swe", full.names = TRUE))
+  # stack_crs <- crs(swe_stack[[1]])
+  # # transform AOI to match raster CRS if needed
+  # if(st_crs(polys_single) != stack_crs) {
+  #   watersheds <- st_transform(polys_single, crs = stack_crs)
+  # } else {
+  #   watersheds <- polys_single
+  # }
+  # 
+  # swe_cropped <- swe_stack %>%
+  #   terra::crop(., watersheds, mask = TRUE, touches = TRUE)
+  # 
+  # terra::writeRaster(
+  #   swe_cropped,
+  #   filename = "data/swe_cropped_stack.tif",
+  #   overwrite = TRUE
+  # )
+  # 
+  # prcp_stack <- terra::rast(list.files("data/daymet/", pattern = "prcp", full.names = TRUE))
+  # stack_crs <- crs(prcp_stack[[1]])
+  # # transform AOI to match raster CRS if needed
+  # if(st_crs(polys_single) != stack_crs) {
+  #   watersheds <- st_transform(polys_single, crs = stack_crs)
+  # } else {
+  #   watersheds <- polys_single
+  # }
+  # 
+  # prcp_cropped <- prcp_stack %>%
+  #   terra::crop(., watersheds, mask = TRUE, touches = TRUE)
+  # 
+  # terra::writeRaster(
+  #   prcp_cropped,
+  #   filename = "data/prcp_cropped_stack.tif",
+  #   overwrite = TRUE
+  # )
+
   # Function to process the data
   process_data <- function(stack, var = "swe") {
     
@@ -72,15 +108,18 @@ daymet_grabber <- function(watersheds){
     return(result)
   }
   
-  swe_stack <- terra::rast(list.files("data/daymet/", pattern = "swe", full.names = TRUE)) %>%
+  swe_stack <-  terra::rast("data/swe_cropped_stack.tif") %>%
+    # terra::rast(list.files("data/daymet/", pattern = "swe", full.names = TRUE)) %>%
     process_data(stack = ., var = "swe") %>%
-    select(-c(ID, swe_jul, swe_aug, swe_sep, swe_oct, swe_nov, swe_dec))
+    select(-c(ID))
   
-  precip_stack <- terra::rast(list.files("data/daymet/", pattern = "prcp", full.names = TRUE)) %>%
+  precip_stack <- terra::rast("data/prcp_cropped_stack.tif") %>%
+    # terra::rast(list.files("data/daymet/", pattern = "prcp", full.names = TRUE)) %>%
     process_data(stack = ., var = "prcp") %>%
     select(-ID)
   
   watersheds <- watersheds %>% 
+    select(index) %>%
     cbind(swe_stack) %>%
     cbind(precip_stack)
   
