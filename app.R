@@ -9,6 +9,7 @@ library(data.table)
 library(tidyverse)
 library(terra)
 library(lwgeom)
+library(openxlsx)
 
 # Load all grabber functions
 list.files("src/", full.names = TRUE) %>% walk(~source(.))
@@ -17,6 +18,9 @@ terraOptions(memfrac = 0.1, todisk = TRUE)
 
 # Load flowlines data instead of raster
 flowlines <- readRDS("data/nhd_flowlines.RDS")
+
+# Load metadata for watershed variables
+metadata <- read_csv("data/watersheds_with_vars_meta.csv")
 
 if (!dir.exists("temp_data")) {
   dir.create("temp_data", recursive = TRUE)
@@ -157,6 +161,7 @@ server <- function(input, output, session) {
   zoom_level <- reactiveVal(7)
   click_point <- reactiveVal(NULL)
   watershed_data <- reactiveVal(NULL)
+  watershed_attributes <- reactiveVal(NULL)
   delineated_watershed <- reactiveVal(NULL)  # Store delineated watershed for confirmation
   watershed_area <- reactiveVal(NULL)  # Store watershed area for CFS conversion
   
@@ -626,7 +631,7 @@ server <- function(input, output, session) {
         unit = units_lookup[flow_stat],
         area_sqkm = watershed_area()
       ) 
-
+    
     # Original metric units (mm-based)
     mm_data <- formatted_predictions %>%
       filter(str_detect(unit, "mm/")) %>%
@@ -679,9 +684,16 @@ server <- function(input, output, session) {
       select(flow_stat, unit, value, lower_ci, upper_ci) %>%
       mutate(across(everything(), as.character))
     
-    
-    
     # Combine all data
+    pretty_ws_vars <- ws_vars %>%
+      select(ws_area_sqkm, rckdepws_streamcat:impervious_percent, road_density_km_per_km2:avg_tot_pet) %>%
+      st_drop_geometry() %>%
+      mutate(across(everything(), as.character)) %>%
+      select(-geometry.y) %>%
+      pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+      left_join(metadata %>% select(variable, units, description, source), by = "variable") %>%
+      select(variable, value, units, description, source)
+    
     formatted_predictions <- bind_rows(mm_data, cfs_data, doy_data, water_year_date_data) %>%
       # Create ordering for flow_stat within each unit type
       mutate(
@@ -691,9 +703,11 @@ server <- function(input, output, session) {
         )
       ) %>%
       arrange(flow_stat_order, unit) %>%
-      select(-flow_stat_order) #%>%
+      select(-flow_stat_order) %>%
+      bind_rows()
     
     watershed_data(formatted_predictions)
+    watershed_attributes(pretty_ws_vars)
     message("Model predictions completed")
     
     # Close progress modal and show completion notification
@@ -710,16 +724,29 @@ server <- function(input, output, session) {
   
   output$download_watershed_data <- downloadHandler(
     filename = function() {
-      paste0("watershed_flow_stats_", Sys.Date(), ".csv")
+      paste0("watershed_analysis_", Sys.Date(), ".xlsx")
     },
     content = function(file) {
-      write_csv(watershed_data(), file)
+      # Create a new workbook
+      wb <- createWorkbook()
+      
+      # Add the flow statistics sheet
+      addWorksheet(wb, "flow_statistics")
+      writeData(wb, "flow_statistics", watershed_data())
+      
+      # Add the watershed attributes sheet
+      addWorksheet(wb, "watershed_attributes")
+      writeData(wb, "watershed_attributes", watershed_attributes())
+      
+      # Save the workbook
+      saveWorkbook(wb, file, overwrite = TRUE)
     }
   )
   
   observeEvent(input$clear_btn, {
     click_point(NULL)
     watershed_data(NULL)
+    watershed_attributes(NULL)
     delineated_watershed(NULL)  # Clear the stored watershed
     watershed_area(NULL)  # Clear stored area
     leafletProxy("map") %>%
