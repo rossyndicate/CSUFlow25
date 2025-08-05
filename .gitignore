@@ -10,3 +10,5 @@ data/flowline_rasters
 data/NHDPlusDEM
 data/temp
 data/
+temp_data
+CSUFlow25_suppstuff
