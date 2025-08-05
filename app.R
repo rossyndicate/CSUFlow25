@@ -1,3 +1,5 @@
+options(shiny.maxRequestSize = 200*1024^2)  # allow up to ~200 MB uploads
+
 library(shiny)
 library(leaflet)
 library(sf)
@@ -10,6 +12,7 @@ library(tidyverse)
 library(terra)
 library(lwgeom)
 library(openxlsx)
+library(tools)
 
 # Load all grabber functions
 list.files("src/", full.names = TRUE) %>% walk(~source(.))
@@ -22,11 +25,10 @@ flowlines <- readRDS("data/nhd_flowlines.RDS")
 # Load metadata for watershed variables
 metadata <- read_csv("data/watersheds_with_vars_meta.csv")
 
-if (!dir.exists("temp_data")) {
-  dir.create("temp_data", recursive = TRUE)
-}
+if (!dir.exists("temp_data")) dir.create("temp_data", recursive = TRUE)
+if (!dir.exists("temp_data/uploaded_shapefile")) dir.create("temp_data/uploaded_shapefile", recursive = TRUE)
 
-# Define lookup table for flow metrics
+# Lookup: flow metrics -> short names
 flow_metric_lookup <- c(
   "model_all_annual_mean_max_q_mmd" = "Qmax",
   "model_all_annual_mean_min_q_mmd" = "Qmin", 
@@ -61,7 +63,7 @@ flow_metric_lookup <- c(
   "model_flood_freq_1.5_q_mmd" = "Bankfull"
 )
 
-# Define units lookup
+# Units lookup
 units_lookup <- c(
   "Qmax" = "mm/day", "Qmin" = "mm/day", "Qdaily" = "mm/day",
   "Qapr" = "mm/month", "Qdec" = "mm/month", "Qfeb" = "mm/month",
@@ -75,24 +77,23 @@ units_lookup <- c(
   "Monsoon" = "fraction", "Bankfull" = "mm/day"
 )
 
-# Define desired order
+# Desired order for final table
 desired_order <- c("Qann", "Qjan", "Qfeb", "Qmar", "Qapr", "Qmay", "Qjun", 
                    "Qjul", "Qaug", "Qsep", "Qoct", "Qnov", "Qdec", "Qmin", 
                    "Q5", "Qmax", "Q95", "Day10", "Day20", "Day30", "Day40", 
                    "Day50", "Day60", "Day70", "Day80", "Day90", "Monsoon", "Bankfull")
 
-# Function to convert mm to CFS
+# Convert mm to cfs
 convert_to_cfs <- function(mm_value, area_sqkm, unit_type, flow_stat = NULL) {
-  # Constant: mm * km^2 to m^3
+  # mm over km^2 -> m^3
   volume_m3 <- mm_value * area_sqkm * 1e6 * 1e-3
   
   if (unit_type == "mm/day") {
-    # m³/day → m³/s → ft³/s
+    # m3/day -> m3/s -> cfs
     return(volume_m3 / 86400 * 35.3147)
     
   } else if (unit_type == "mm/month") {
-    # Determine number of days in the month
-    days_in_month <- case_when(
+    days_in_month <- dplyr::case_when(
       flow_stat == "Qjan" ~ 31,
       flow_stat == "Qfeb" ~ 28.25,
       flow_stat == "Qmar" ~ 31,
@@ -111,60 +112,134 @@ convert_to_cfs <- function(mm_value, area_sqkm, unit_type, flow_stat = NULL) {
     
   } else if (unit_type == "mm/year") {
     return(volume_m3 / (365.25 * 86400) * 35.3147)
-    
-  } else {
-    return(NA_real_)  # Return numeric NA
   }
+  
+  return(NA_real_)
 }
 
-
-# Function to convert day of water year to date
+# Day-of-water-year -> date converter (WY starting Oct 1, using 2023-10-01 ref)
 day_to_date <- function(day_of_wy) {
-  # Water year starts Oct 1
-  start_date <- as.Date("2023-10-01") # Using 2023 as reference year
+  start_date <- as.Date("2023-10-01")
   return(start_date + day_of_wy - 1)
 }
 
 ui <- page_fluid(
   useShinyjs(),
   h2("CSUFlow25 Streamflow Prediction"),
-  p("Click a point on the map to select a pour point. The point should be on a flowline, which you can see after zooming in to level 12. Confirm before delineation."),
+  p("Choose to upload your own watershed polygon or delineate from a map click. 
+    If delineating, the point should be on a flowline (visible at zoom level 12+)."),
   fluidRow(
-    column(3, actionButton("clear_btn", "Clear Watershed", icon = icon("trash"))),
-    column(3, actionButton("help_btn", "Help / Directions", icon = icon("info-circle"))),
-    column(3, downloadButton("download_watershed_data", "Download Flow Stats")),
-    column(3, textOutput("zoom_level_text"))
+    column(4, 
+           actionButton("clear_btn", "Start Over", 
+                        icon = icon("refresh"), 
+                        class = "btn btn-danger btn-lg",
+                        style = "width: 100%;")),
+    column(2, 
+           actionButton("help_btn", "Help", 
+                        icon = icon("info-circle"),
+                        style = "width: 100%;")),
+    column(3, 
+           downloadButton("download_watershed_data", "Download Results",
+                          style = "width: 100%;")),
+    column(3, 
+           textOutput("zoom_level_text")),
+    conditionalPanel(
+      condition = "input.input_method == 'upload'",
+      fileInput("uploaded_file", "Upload watershed shapefile (.zip) or GeoJSON", 
+                accept = c(".zip", ".geojson"))
+    )
   ),
   card(
     full_screen = TRUE,
     card_header("Interactive Map"),
     leafletOutput("map", height = "600px")
+  ),
+  # Move watershed confirmation panel below the map
+  conditionalPanel(
+    condition = "output.show_watershed_panel",
+    card(
+      card_header("Watershed Confirmation"),
+      div(
+        id = "watershed_confirmation_content",
+        style = "padding: 20px;",
+        # Content will be populated by server
+        htmlOutput("watershed_confirmation_html")
+      )
+    )
   )
 )
 
 server <- function(input, output, session) {
-  showModal(modalDialog(
-    title = "Directions",
-    easyClose = TRUE,
-    footer = modalButton("Close"),
-    HTML("
-      <ul>
-        <li>Click a location on the map to select a pour point. The point should be on a flowline, which you can see after zooming in to level 12+.</li>
-        <li>Confirm the point to begin watershed delineation and flow statistics generation.</li>
-        <li>The watershed will be displayed in red.</li>
-        <li>Use the 'Clear Watershed' button to reset.</li>
-        <li>Once the statistics have been calculated, use the 'Download Flow Stats' button to download.</li>
-      </ul>
-    ")
-  ))
-  
+  # --- Reactive state ---
+  workflow_choice <- reactiveVal(NULL) # "upload" or "delineate"
   zoom_level <- reactiveVal(7)
   click_point <- reactiveVal(NULL)
   watershed_data <- reactiveVal(NULL)
   watershed_attributes <- reactiveVal(NULL)
-  delineated_watershed <- reactiveVal(NULL)  # Store delineated watershed for confirmation
-  watershed_area <- reactiveVal(NULL)  # Store watershed area for CFS conversion
+  current_watershed <- reactiveVal(NULL)  # Stores the current watershed SF object
+  watershed_area <- reactiveVal(NULL)
+  watershed_source <- reactiveVal(NULL)  # Track if watershed is "uploaded" or "delineated"
+  show_confirmation_panel <- reactiveVal(FALSE)
   
+  # Control visibility of watershed confirmation panel
+  output$show_watershed_panel <- reactive({
+    show_confirmation_panel()
+  })
+  outputOptions(output, "show_watershed_panel", suspendWhenHidden = FALSE)
+  
+  # --- Helper function to reset app state ---
+  reset_app_state <- function() {
+    # Clear all reactive values
+    workflow_choice(NULL)
+    zoom_level(7)
+    click_point(NULL)
+    watershed_data(NULL)
+    watershed_attributes(NULL)
+    current_watershed(NULL)
+    watershed_area(NULL)
+    watershed_source(NULL)
+    show_confirmation_panel(FALSE)
+    
+    # Clear map layers
+    leafletProxy("map") %>%
+      clearGroup("watershed") %>%
+      clearGroup("click_point") %>%
+      clearGroup("flowlines") %>%
+      setView(lng = -105.5, lat = 39, zoom = 7)  # Reset to initial view
+    
+    # Clear any file inputs
+    shinyjs::reset("uploaded_file")
+    
+    # Clear any notifications
+    removeNotification(id = NULL)  # Remove all notifications
+  }
+  
+  # --- Initial setup ---
+  observe({
+    # Show method chooser on startup
+    showModal(modalDialog(
+      title = "Choose Watershed Input Method",
+      easyClose = FALSE,
+      footer = NULL,
+      radioButtons("input_method", "Select how you want to provide the watershed:",
+                   choices = c("Delineate with map click" = "delineate",
+                               "Upload my own shapefile/GeoJSON" = "upload")),
+      actionButton("proceed_method", "Proceed")
+    ))
+  })
+  
+  observeEvent(input$proceed_method, {
+    req(input$input_method)
+    workflow_choice(input$input_method)
+    removeModal()
+    if (input$input_method == "upload") {
+      showNotification("Upload a zipped shapefile (.zip) or a GeoJSON to continue.", type = "message")
+    } else {
+      showNotification("Click on the map (on a flowline) to delineate.", type = "message")
+    }
+  })
+  
+  # --- Map setup ---
   output$map <- renderLeaflet({
     leaflet() %>%
       addProviderTiles(providers$Esri.WorldTopoMap) %>%
@@ -178,38 +253,30 @@ server <- function(input, output, session) {
       footer = modalButton("Close"),
       HTML("
         <ul>
-          <li>Click a location on the map to select a pour point. The point should be on a flowline, which you can see after zooming in to scale 12+.</li>
-          <li>Confirm the point to begin watershed delineation and flow statistics generation.</li>
-          <li>The watershed will be displayed in red.</li>
-          <li>Use the 'Clear Watershed' button to reset.</li>
-          <li>Once the statistics have been calculated, use the 'Download Flow Stats' button to download.</li>
+          <li>Choose to upload a watershed or delineate with the map.</li>
+          <li>For delineation: zoom to 12+, click on a flowline to delineate upstream watershed.</li>
+          <li>For upload: select a zipped shapefile or GeoJSON file.</li>
+          <li>Once the watershed appears in red, confirm to run flow analysis or start over with a different watershed.</li>
+          <li>Use 'Start Over' to reset and choose a new method or watershed.</li>
         </ul>
       ")
     ))
   })
   
+  # Flowlines on zoom
   observe({
     map_zoom <- input$map_zoom
     map_bounds <- input$map_bounds
     if (!is.null(map_zoom) && !is.null(map_bounds)) {
       zoom_level(map_zoom)
       if (map_zoom >= 12) {
-        # Create bounding box for current view
         bbox <- st_bbox(c(xmin = map_bounds$west, ymin = map_bounds$south, 
                           xmax = map_bounds$east, ymax = map_bounds$north), 
                         crs = st_crs(4326))
-        
-        # Transform bbox to match flowlines CRS
-        bbox_poly <- st_as_sfc(bbox) %>% 
-          st_transform(st_crs(flowlines))
-        
+        bbox_poly <- st_as_sfc(bbox) %>% st_transform(st_crs(flowlines))
         tryCatch({
-          # Filter flowlines to current map extent
           visible_flowlines <- st_filter(flowlines, bbox_poly)
-          
-          # Transform back to WGS84 for leaflet
           visible_flowlines_4326 <- st_transform(visible_flowlines, 4326)
-          
           leafletProxy("map") %>%
             clearGroup("flowlines") %>%
             addPolylines(data = visible_flowlines_4326, 
@@ -228,14 +295,18 @@ server <- function(input, output, session) {
   
   output$zoom_level_text <- renderText({
     current_zoom <- zoom_level()
-    if (current_zoom < 12) {
+    if (current_zoom < 12 && !is.null(workflow_choice()) && workflow_choice() == "delineate") {
       paste("Current zoom level:", current_zoom, "- Zoom in closer to see flowlines")
-    } else {
+    } else if (!is.null(workflow_choice()) && workflow_choice() == "delineate") {
       paste("Current zoom level:", current_zoom, "- Flowlines visible")
+    } else {
+      paste("Current zoom level:", current_zoom)
     }
   })
   
+  # --- Map delineation workflow ---
   observeEvent(input$map_click, {
+    if (is.null(workflow_choice()) || workflow_choice() != "delineate") return(NULL)
     click <- input$map_click
     if (!is.null(click)) {
       test_site <- st_sf(geometry = st_sfc(st_point(c(click$lng, click$lat)), crs = 4326))
@@ -243,109 +314,325 @@ server <- function(input, output, session) {
       leafletProxy("map") %>%
         clearGroup("click_point") %>%
         addMarkers(data = test_site, group = "click_point")
-      showModal(modalDialog(
-        title = "Confirm Pour Point",
-        "Do you want to delineate the watershed from this location?",
-        easyClose = TRUE,
-        footer = tagList(
-          modalButton("Cancel"),
-          actionButton("confirm_click", "Yes, Delineate")
-        )
-      ))
+      
+      # Automatically start delineation without modal confirmation
+      do_delineation(test_site)
     }
   })
   
-  # First confirmation: Delineate watershed
-  observeEvent(input$confirm_click, {
-    removeModal()
-    req(click_point())
-    test_site <- click_point()
-    test_site_3857 <- st_transform(test_site, 3857)
-    
-    # Convert point to the format expected by get_split_catchment
-    point_sfc <- st_geometry(test_site_3857)
-    
-    raindrop <- get_raindrop_trace(point = point_sfc, direction = "down")
-    
-    nearest_point <- st_as_sf(data.frame(x = raindrop$intersection_point[[1]][1],
-                                         y = raindrop$intersection_point[[1]][2]),
-                              coords = c("x", "y"),
-                              crs = st_crs(raindrop)) %>%
-      st_as_sfc() 
-    
-    # Delineate watershed using nhdplusTools
-    better_termination <- get_split_catchment(point = nearest_point, upstream = TRUE)[2,]
-    
-    # Create watershed_sf with proper structure and fix geometry issues
-    watershed_sf <- better_termination %>%
-      mutate(index = "User Watershed") %>%
-      select(index, geometry)
-    
-    # Fix any geometry issues
-    watershed_sf <- watershed_sf %>%
-      st_make_valid() %>%
-      st_buffer(0)  # This can help fix topology issues
-    
-    # Calculate and store watershed area
-    ws_area <- as.numeric(st_area(watershed_sf) / 1e6)  # Convert to km2
-    watershed_area(ws_area)
-    
-    message("Watershed delineated successfully")
-    
-    # Store the delineated watershed for confirmation
-    delineated_watershed(watershed_sf)
-    
-    # Display watershed on map
-    leafletProxy("map") %>%
-      clearGroup("watershed") %>%
-      addPolygons(data = st_transform(watershed_sf, 4326), 
-                  color = "red", weight = 2, fillOpacity = 0.3, group = "watershed")
-    
-    # Show confirmation dialog for watershed
+  # Modified delineation function
+  do_delineation <- function(test_site) {
+    # Show processing message
     showModal(modalDialog(
-      title = "Confirm Watershed Delineation",
-      HTML("
-        <p>The watershed has been delineated and is shown in red on the map.</p>
-        <p><strong>Is this the correct watershed for your analysis?</strong></p>
-        <p>If yes, the system will proceed with variable extraction and flow statistics calculation.</p>
-        <p>If no, you can select a different pour point.</p>
-      "),
+      title = "Delineating Watershed",
+      "Please wait while the watershed is being delineated...",
       easyClose = FALSE,
-      footer = tagList(
-        actionButton("reject_watershed", "No, select different point", class = "btn btn-warning"),
-        actionButton("confirm_watershed", "Yes, continue with analysis", class = "btn btn-success")
-      )
+      footer = NULL
     ))
     
-    # Clean up temporary objects
-    rm(better_termination)
-    gc()
-  })
-  
-  # Handle watershed rejection
-  observeEvent(input$reject_watershed, {
-    removeModal()
+    test_site_3857 <- st_transform(test_site, 3857)
+    point_sfc <- st_geometry(test_site_3857)
     
-    # Clear the watershed display and stored data
-    delineated_watershed(NULL)
+    tryCatch({
+      raindrop <- get_raindrop_trace(point = point_sfc, direction = "down")
+      nearest_point <- st_as_sf(data.frame(x = raindrop$intersection_point[[1]][1],
+                                           y = raindrop$intersection_point[[1]][2]),
+                                coords = c("x", "y"),
+                                crs = st_crs(raindrop)) %>% st_as_sfc() 
+      
+      # Delineate watershed using nhdplusTools
+      better_termination <- get_split_catchment(point = nearest_point, upstream = TRUE)[2,]
+      
+      watershed_sf <- better_termination %>%
+        mutate(index = "Delineated Watershed") %>%
+        select(index, geometry) %>%
+        st_make_valid() %>%
+        st_buffer(0)
+      
+      ws_area <- as.numeric(st_area(watershed_sf) / 1e6)  # km^2
+      watershed_area(ws_area)
+      current_watershed(watershed_sf)
+      watershed_source("delineated")
+      
+      # Transform to 4326 for display
+      watershed_4326 <- st_transform(watershed_sf, 4326)
+      
+      # Add watershed to map and zoom to it
+      leafletProxy("map") %>%
+        clearGroup("watershed") %>%
+        addPolygons(data = watershed_4326, 
+                    color = "red", weight = 2, fillOpacity = 0.3, group = "watershed")
+      
+      # Zoom to watershed bounds
+      bounds <- st_bbox(watershed_4326)
+      leafletProxy("map") %>%
+        fitBounds(lng1 = bounds["xmin"], lat1 = bounds["ymin"],
+                  lng2 = bounds["xmax"], lat2 = bounds["ymax"])
+      
+      removeModal()
+      
+      # Show confirmation panel below map instead of modal
+      show_watershed_confirmation_panel(ws_area, "delineated")
+      
+      rm(better_termination); gc()
+      
+    }, error = function(e) {
+      removeModal()
+      showNotification(paste("Error delineating watershed:", e$message), type = "error", duration = 8)
+    })
+  }
+  
+  # --- Upload workflow ---
+  observe({
+    if (is.null(workflow_choice()) || workflow_choice() != "upload") return(NULL)
+    req(input$uploaded_file)
+    
+    current_watershed(NULL)
     watershed_area(NULL)
-    leafletProxy("map") %>%
-      clearGroup("watershed")
     
-    # Show message to user
-    showNotification("Watershed cleared. Please select a new pour point.", 
-                     duration = 3)
+    ext <- tolower(tools::file_ext(input$uploaded_file$name))
+    user_ws <- NULL
+    read_err <- NULL
+    
+    # Unique temp dir for this upload
+    up_dir <- file.path(tempdir(), paste0("ws_", as.integer(Sys.time())))
+    dir.create(up_dir, recursive = TRUE, showWarnings = FALSE)
+    
+    tryCatch({
+      if (ext == "zip") {
+        unzip(input$uploaded_file$datapath, exdir = up_dir)
+        shp_files <- list.files(up_dir, pattern = "\\.shp$", full.names = TRUE, recursive = TRUE)
+        if (length(shp_files) == 0) stop("No .shp file found inside the ZIP.")
+        pick_valid_shp <- function(paths) {
+          for (p in paths) {
+            base <- tools::file_path_sans_ext(p)
+            comp_ok <- all(file.exists(paste0(base, c(".dbf", ".shx"))))
+            if (comp_ok) return(p)
+          }
+          return(paths[1])
+        }
+        shp_path <- pick_valid_shp(shp_files)
+        message("Reading shapefile: ", shp_path)
+        user_ws <- suppressWarnings(sf::st_read(dsn = shp_path, quiet = TRUE))
+      } else if (ext == "geojson" || grepl("\\.geojson$", tolower(input$uploaded_file$name))) {
+        message("Reading GeoJSON: ", input$uploaded_file$name)
+        user_ws <- suppressWarnings(sf::st_read(input$uploaded_file$datapath, quiet = TRUE))
+      } else {
+        stop("Unsupported file type. Upload a zipped shapefile (.zip) or a GeoJSON.")
+      }
+    }, error = function(e) {
+      read_err <<- e$message
+    })
+    
+    if (is.null(user_ws)) {
+      showNotification(paste0("Failed to read uploaded watershed: ", if (!is.null(read_err)) read_err else "unknown error"),
+                       type = "error", duration = 8)
+      return(NULL)
+    }
+    
+    # Normalize and validate geometry
+    tryCatch({
+      user_ws <- suppressWarnings(sf::st_zm(user_ws, drop = TRUE, what = "ZM"))
+      gtype <- unique(sf::st_geometry_type(user_ws))
+      if (!any(grepl("POLYGON", gtype))) {
+        stop(sprintf("Uploaded layer is not polygonal (geometry types: %s). Please upload a polygon watershed.",
+                     paste(gtype, collapse = ", ")))
+      }
+      user_ws <- sf::st_make_valid(user_ws)
+      
+      # Dissolve to one polygon
+      user_ws <- user_ws %>%
+        dplyr::mutate(dissolve_id = 1) %>%
+        dplyr::group_by(dissolve_id) %>%
+        dplyr::summarise(.groups = "drop")
+      
+      if (is.na(sf::st_crs(user_ws))) {
+        showNotification("Warning: Uploaded layer has no CRS; assuming EPSG:4326 (lat/lon).", type = "warning")
+        sf::st_crs(user_ws) <- 4326
+      } else {
+        user_ws <- sf::st_transform(user_ws, 4326)
+      }
+      
+      if (!"index" %in% names(user_ws)) {
+        user_ws <- dplyr::mutate(user_ws, index = "Uploaded Watershed") %>%
+          dplyr::select(index, geometry = geometry)
+      } else {
+        user_ws <- dplyr::select(user_ws, index, geometry = geometry)
+      }
+      
+      ws_area_km2 <- as.numeric(sf::st_area(sf::st_transform(user_ws, 3857)) / 1e6)
+      current_watershed(user_ws)
+      watershed_area(ws_area_km2)
+      watershed_source("uploaded")
+      
+      # Add watershed to map
+      leafletProxy("map") %>%
+        clearGroup("watershed") %>%
+        addPolygons(data = user_ws, color = "red", weight = 2, fillOpacity = 0.3, group = "watershed")
+      
+      # Zoom to the uploaded watershed
+      bounds <- sf::st_bbox(user_ws)
+      leafletProxy("map") %>%
+        fitBounds(lng1 = bounds["xmin"], lat1 = bounds["ymin"],
+                  lng2 = bounds["xmax"], lat2 = bounds["ymax"])
+      
+      # Show confirmation panel below map instead of modal
+      show_watershed_confirmation_panel(ws_area_km2, "uploaded")
+      
+    }, error = function(e) {
+      showNotification(paste0("Problem preparing uploaded geometry: ", e$message),
+                       type = "error", duration = 10)
+    })
   })
   
-  # Handle watershed confirmation and proceed with analysis
-  observeEvent(input$confirm_watershed, {
+  # --- Modified confirmation function to show panel instead of modal ---
+  show_watershed_confirmation_panel <- function(ws_area, source_type) {
+    show_confirmation_panel(TRUE)
+    
+    output$watershed_confirmation_html <- renderUI({
+      div(
+        h4(paste("Confirm", str_to_title(source_type), "Watershed")),
+        p(paste("The watershed has been", source_type, "and is shown in red on the map.")),
+        p(HTML(paste0("Estimated area: <strong>", round(ws_area, 2), " km²</strong>"))),
+        p("Would you like to proceed with flow statistics calculation for this watershed?"),
+        br(),
+        div(
+          style = "text-align: center;",
+          actionButton("start_over_from_confirm", "Start Over", 
+                       class = "btn btn-secondary", style = "margin-right: 10px;"),
+          actionButton("choose_different", "Choose Different Watershed", 
+                       class = "btn btn-warning", style = "margin-right: 10px;"),
+          actionButton("confirm_watershed", "Yes, Calculate Flow Statistics", 
+                       class = "btn btn-success")
+        )
+      )
+    })
+  }
+  
+  # --- Enhanced Start Over functionality ---
+  observeEvent(input$start_over, {
+    # Close any open modals first
     removeModal()
-    req(delineated_watershed())
     
-    watershed_sf <- delineated_watershed()
-    test_site <- click_point()
+    # Reset all app state
+    reset_app_state()
     
-    # Show progress modal with progress bar
+    # Show method chooser again
+    showModal(modalDialog(
+      title = "Choose Watershed Input Method",
+      easyClose = FALSE,
+      footer = NULL,
+      radioButtons("input_method", "Select how you want to provide the watershed:",
+                   choices = c("Delineate with map click" = "delineate",
+                               "Upload my own shapefile/GeoJSON" = "upload")),
+      actionButton("proceed_method", "Proceed")
+    ))
+    
+    showNotification("Starting over - choose your watershed input method.", 
+                     duration = 3, type = "message")
+  })
+  
+  # Also bind the clear button to the same functionality
+  observeEvent(input$clear_btn, {
+    # Close any open modals first
+    removeModal()
+    
+    # Reset all app state
+    reset_app_state()
+    
+    # Show method chooser again
+    showModal(modalDialog(
+      title = "Choose Watershed Input Method",
+      easyClose = FALSE,
+      footer = NULL,
+      radioButtons("input_method", "Select how you want to provide the watershed:",
+                   choices = c("Delineate with map click" = "delineate",
+                               "Upload my own shapefile/GeoJSON" = "upload")),
+      actionButton("proceed_method", "Proceed")
+    ))
+    
+    showNotification("Starting over - choose your watershed input method.", 
+                     duration = 3, type = "message")
+  })
+  
+  # Add observer for starting over from confirmation panel
+  observeEvent(input$start_over_from_confirm, {
+    reset_app_state()
+    
+    showModal(modalDialog(
+      title = "Choose Watershed Input Method",
+      easyClose = FALSE,
+      footer = NULL,
+      radioButtons("input_method", "Select how you want to provide the watershed:",
+                   choices = c("Delineate with map click" = "delineate",
+                               "Upload my own shapefile/GeoJSON" = "upload")),
+      actionButton("proceed_method", "Proceed")
+    ))
+    
+    showNotification("Starting over - choose your watershed input method.", 
+                     duration = 3, type = "message")
+  })
+  
+  # Keep existing choose_different functionality but rename the observer
+  observeEvent(input$choose_different, {
+    # Clear watershed-specific data but keep the workflow choice
+    current_watershed(NULL)
+    watershed_area(NULL)
+    watershed_source(NULL)
+    click_point(NULL)
+    watershed_data(NULL)
+    watershed_attributes(NULL)
+    show_confirmation_panel(FALSE)
+    
+    # Clear map watershed but keep flowlines if visible
+    leafletProxy("map") %>%
+      clearGroup("watershed") %>%
+      clearGroup("click_point")
+    
+    # Provide appropriate message based on current workflow
+    if (!is.null(workflow_choice())) {
+      if (workflow_choice() == "upload") {
+        showNotification("Upload a different watershed file.", duration = 3, type = "message")
+      } else {
+        showNotification("Click on a different location to delineate a new watershed.", 
+                         duration = 3, type = "message")
+      }
+    }
+  })
+  
+  # --- Analysis workflow ---
+  observeEvent(input$confirm_watershed, {
+    req(current_watershed())
+    show_confirmation_panel(FALSE)  # Hide confirmation panel during analysis
+    do_analysis(current_watershed(), watershed_source())
+  })
+  
+  # Add observer for canceling analysis
+  observeEvent(input$cancel_analysis, {
+    # Close the progress modal
+    removeModal()
+    
+    # Reset app state
+    reset_app_state()
+    
+    # Show method chooser
+    showModal(modalDialog(
+      title = "Choose Watershed Input Method",
+      easyClose = FALSE,
+      footer = NULL,
+      radioButtons("input_method", "Select how you want to provide the watershed:",
+                   choices = c("Delineate with map click" = "delineate",
+                               "Upload my own shapefile/GeoJSON" = "upload")),
+      actionButton("proceed_method", "Proceed")
+    ))
+    
+    showNotification("Analysis canceled. Starting over - choose your watershed input method.", 
+                     duration = 3, type = "warning")
+  })
+  
+  # --- Shared analysis function ---
+  do_analysis <- function(watershed_sf, source_type) {
+    # Progress modal with start over option
     showModal(modalDialog(
       title = "Processing Watershed Analysis",
       div(
@@ -362,13 +649,16 @@ server <- function(input, output, session) {
             style = "width: 0%",
             "0%"
           )
-        )
+        ),
+        br(),
+        # Add start over button during processing
+        actionButton("cancel_analysis", "Cancel & Start Over", 
+                     class = "btn btn-warning btn-sm")
       ),
       easyClose = FALSE,
       footer = NULL
     ))
     
-    # Function to update progress
     update_progress <- function(step, total_steps, message) {
       percent <- round((step / total_steps) * 100)
       runjs(sprintf(
@@ -379,43 +669,59 @@ server <- function(input, output, session) {
       ))
     }
     
-    # Total steps: 13 data processing steps + models
     model_files <- list.files("data/models/", full.names = TRUE)
-    # Filter out the excluded model
     model_files <- model_files[!grepl("all_annual_meanQ_mmd", model_files)]
     total_steps <- 13 + length(model_files)
     current_step <- 0
     
-    # ---- Variable Extraction - Memory Optimized ----
-    message("Starting variable extraction...")
-    
-    # Step 1: Initialize with basic watershed metrics
+    # 1) Area
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Calculating watershed area...")
-    
     ws_vars <- watershed_sf %>%
-      st_make_valid() %>%  # Ensure valid geometry
+      st_make_valid() %>%
       mutate(ws_area_sqkm = tryCatch({
         as.numeric(st_area(.) / 1e6)
       }, error = function(e) {
         message("Error calculating area, using simplified geometry")
         as.numeric(st_area(st_simplify(., dTolerance = 1)) / 1e6)
       }))
+    gc()
     
-    message("Base watershed area calculated")
-    gc() # Clean up after area calculation
-    
-    # Step 2: Extract COMID
+    # 2) COMID -
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Extracting COMID for StreamCat data...")
+    if (source_type == "uploaded") {
+      
+      # Find the most appropriate comid for the user-supplied watershed
+      nearby_ws <- nhdplusTools::get_nhdplus(AOI = watershed_sf, realization = "catchment") %>%
+        left_join(., data.table::fread("data/COLORADO_SOIL_STREAMCAT.csv"), by = c("featureid" = "comid")) %>%
+        mutate(area_ws = st_area(.))
+      sf_use_s2(FALSE)
+      comids <- st_intersection(nearby_ws, watershed_sf) %>%
+        mutate(percent_overlap = as.numeric(st_area(.) / area_ws) * 100) %>%
+        filter(percent_overlap > 75) %>%
+        filter(wsareasqkm == max(wsareasqkm)) %>%
+        pull(featureid)
+      sf_use_s2(TRUE)
+      
+    } else {
+      comids <- tryCatch({
+        if (!is.null(click_point())) {
+          get_nhdplus(AOI = click_point()) %>% pull(comid)
+        } else {
+          centroid_pt <- st_centroid(st_transform(watershed_sf, 4326))
+          get_nhdplus(AOI = centroid_pt) %>% pull(comid)
+        }
+      }, error = function(e) {
+        message("COMID extraction failed: ", e$message)
+        # Default fallback?
+      })
+      message("COMID extracted: ", paste(comids, collapse = ", "))
+    }
     
-    comids <- get_nhdplus(AOI = test_site) %>% pull(comid)
-    message("COMID extracted: ", comids)
-    
-    # Step 3: Process StreamCat data
+    # 3) StreamCat
     current_step <- current_step + 1
-    update_progress(current_step, total_steps, "Processing soils data...")
-    
+    update_progress(current_step, total_steps, "Processing soils/StreamCat data...")
     streamcat_temp <- watershed_sf %>%
       mutate(comid = comids) %>%
       direct_streamcat_data() %>%
@@ -424,162 +730,84 @@ server <- function(input, output, session) {
       st_drop_geometry() %>%
       rename_with(~ paste0(., "_streamcat"), -index) %>%
       select(-c(comid_streamcat))
+    ws_vars <- ws_vars %>% left_join(streamcat_temp, by = "index")
+    rm(streamcat_temp); gc()
     
-    ws_vars <- ws_vars %>%
-      left_join(streamcat_temp, by = "index")
-    
-    rm(streamcat_temp)
-    gc()
-    message("StreamCat data processed and added")
-    
-    # Step 4: Process aspect data
+    # 4) Aspect
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing aspect data...")
+    aspect_temp <- aspect_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(aspect_temp, by = "index")
+    rm(aspect_temp); gc()
     
-    aspect_temp <- aspect_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(aspect_temp, by = "index")
-    
-    rm(aspect_temp)
-    gc()
-    message("Aspect data processed and added")
-    
-    # Step 5: Process daymet data
+    # 5) Daymet
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing SWE and precipitation data...")
+    daymet_temp <- daymet_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(daymet_temp, by = "index")
+    rm(daymet_temp); gc()
     
-    daymet_temp <- daymet_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(daymet_temp, by = "index")
-    
-    rm(daymet_temp)
-    gc()
-    message("Daymet data processed and added")
-    
-    # Step 6: Process snow persistence data
+    # 6) Snow persistence
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing snow persistence data...")
+    snow_temp <- snow_persistence_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(snow_temp, by = "index")
+    rm(snow_temp); gc()
     
-    snow_temp <- snow_persistence_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(snow_temp, by = "index")
-    
-    rm(snow_temp)
-    gc()
-    message("Snow persistence data processed and added")
-    
-    # Step 7: Process geology data
+    # 7) Geology
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing geology data...")
+    geology_temp <- geology_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(geology_temp, by = "index")
+    rm(geology_temp); gc()
     
-    geology_temp <- geology_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(geology_temp, by = "index")
-    
-    rm(geology_temp)
-    gc()
-    message("Geology data processed and added")
-    
-    # Step 8: Process dam data
+    # 8) Dams
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing dam data...")
+    dam_temp <- dam_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(dam_temp, by = "index")
+    rm(dam_temp); gc()
     
-    dam_temp <- dam_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(dam_temp, by = "index")
-    
-    rm(dam_temp)
-    gc()
-    message("Dam data processed and added")
-    
-    # Step 9: Process NLCD data
+    # 9) NLCD
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing land cover data...")
+    nlcd_temp <- nlcd_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(nlcd_temp, by = "index")
+    rm(nlcd_temp); gc()
     
-    nlcd_temp <- nlcd_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(nlcd_temp, by = "index")
-    
-    rm(nlcd_temp)
-    gc()
-    message("NLCD data processed and added")
-    
-    # Step 10: Process road density data
+    # 10) Roads
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing road density data...")
+    road_temp <- road_density_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(road_temp, by = "index")
+    rm(road_temp); gc()
     
-    road_temp <- road_density_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(road_temp, by = "index")
-    
-    rm(road_temp)
-    gc()
-    message("Road density data processed and added")
-    
-    # Step 11: Process fire data
+    # 11) Fire
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing fire history data...")
+    fire_temp <- fire_grabber(watershed_sf) %>% st_drop_geometry()
+    ws_vars <- ws_vars %>% left_join(fire_temp, by = "index")
+    rm(fire_temp); gc()
     
-    fire_temp <- fire_grabber(watershed_sf) %>% 
-      st_drop_geometry()
-    
-    ws_vars <- ws_vars %>%
-      left_join(fire_temp, by = "index")
-    
-    rm(fire_temp)
-    gc()
-    message("Fire data processed and added")
-    
-    # Step 12: Process hydroregion data
+    # 12) Hydroregion
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing hydroregion data...")
-    
     hydro_temp <- find_dominant_hydroregion(watershed_sf)
+    ws_vars <- ws_vars %>% left_join(hydro_temp, by = "index")
+    rm(hydro_temp); gc()
     
-    ws_vars <- ws_vars %>%
-      left_join(hydro_temp, by = "index")
-    
-    rm(hydro_temp)
-    gc()
-    message("Hydroregion data processed and added")
-    
-    # Step 13: Process climate historic data
+    # 13) Climate historic / PET
     current_step <- current_step + 1
     update_progress(current_step, total_steps, "Processing PET data...")
-    
     climate_temp <- get_climate_historic_frac_overlap(watershed_sf)
+    ws_vars <- ws_vars %>% left_join(climate_temp, by = "index")
+    rm(climate_temp); gc()
     
-    ws_vars <- ws_vars %>%
-      left_join(climate_temp, by = "index")
+    ws_vars <- ws_vars %>% rename_all(tolower)
+    message("All variables processed successfully"); gc()
     
-    rm(climate_temp)
-    gc()
-    message("Climate historic data processed and added")
-    
-    # Final cleanup and standardization
-    ws_vars <- ws_vars %>%
-      rename_all(tolower)
-    
-    message("All variables processed successfully")
-    gc() # Final garbage collection
-    
-    # Run prediction models with confidence intervals
+    # Models
     message("Running prediction models...")
-    
     all_predictions <- map_dfr(model_files, function(file) {
       current_step <<- current_step + 1
       metric <- tools::file_path_sans_ext(basename(file))
@@ -587,52 +815,38 @@ server <- function(input, output, session) {
       
       tryCatch({
         model <- readRDS(file)
-        
-        # Get predictions with 95% confidence intervals
         preds <- predict(model, newdata = ws_vars, interval = "confidence", level = 0.95)
-        
-        # Handle different prediction output formats
-        if(is.matrix(preds) && ncol(preds) >= 3) {
-          # Standard matrix format with fit, lwr, upr columns
-          prediction <- preds[,"fit"]^2      # Point prediction
-          lower_ci <- preds[,"lwr"]^2        # Lower confidence interval
-          upper_ci <- preds[,"upr"]^2        # Upper confidence interval
+        if (is.matrix(preds) && ncol(preds) >= 3) {
+          prediction <- preds[, "fit"]^2
+          lower_ci <- preds[, "lwr"]^2
+          upper_ci <- preds[, "upr"]^2
         } else {
-          # Unknown format - log and skip
           message("Unknown prediction format for model: ", metric)
           return(NULL)
         }
-        
-        # Clean up model object immediately after use
-        rm(model)
-        gc()
-        
+        rm(model); gc()
         tibble(
           flow_metric = metric %>% tolower(), 
           prediction = prediction,
-          lower_95ci = pmax(0, lower_ci),  # Ensure non-negative
+          lower_95ci = pmax(0, lower_ci),
           upper_95ci = upper_ci
         )
-        
       }, error = function(e) {
         message("Error processing model ", metric, ": ", e$message)
         return(NULL)
       })
-    }) %>%
-      filter(!is.null(.))
+    }) %>% filter(!is.null(.))
     
-    # Process and format the predictions
+    # Format predictions
     formatted_predictions <- all_predictions %>%
-      # Apply lookup table to rename metrics
       mutate(flow_stat = flow_metric_lookup[flow_metric]) %>%
-      filter(!is.na(flow_stat)) %>%  # Remove any metrics not in lookup
-      # Add units and area
+      filter(!is.na(flow_stat)) %>%
       mutate(
         unit = units_lookup[flow_stat],
-        area_sqkm = watershed_area()
-      ) 
+        area_sqkm = as.numeric(watershed_area())
+      )
     
-    # Original metric units (mm-based)
+    # mm-based
     mm_data <- formatted_predictions %>%
       filter(str_detect(unit, "mm/")) %>%
       mutate(
@@ -643,26 +857,25 @@ server <- function(input, output, session) {
       select(flow_stat, unit, value, lower_ci, upper_ci) %>%
       mutate(across(everything(), as.character))
     
-    # CFS conversions (only for flow metrics, not fractions or days)
+    # cfs conversions
     cfs_data <- formatted_predictions %>%
-      filter(str_detect(unit, "mm/")) %>%  # Only convert mm-based units
+      filter(str_detect(unit, "mm/")) %>%
       mutate(
         unit = "cfs",
         value = mapply(convert_to_cfs, prediction, area_sqkm, units_lookup[flow_stat], flow_stat),
         lower_ci = mapply(convert_to_cfs, lower_95ci, area_sqkm, units_lookup[flow_stat], flow_stat),
         upper_ci = mapply(convert_to_cfs, upper_95ci, area_sqkm, units_lookup[flow_stat], flow_stat)
       ) %>%
-      mutate(value = round(value,3),
+      mutate(value = round(value, 3),
              lower_ci = round(lower_ci, 3),
              upper_ci = round(upper_ci, 3)) %>%
       select(flow_stat, unit, value, lower_ci, upper_ci) %>%
       mutate(across(everything(), as.character))
     
-    # Date conversions (for Day metrics, add date equivalent rows)
+    # day-of-year
     doy_data <- formatted_predictions %>%
       filter(str_starts(flow_stat, "Day")) %>%
       mutate(
-        # flow_stat = flow_stat,
         unit = "day of water year",
         value = round(prediction),
         lower_ci = round(lower_95ci),
@@ -671,11 +884,10 @@ server <- function(input, output, session) {
       select(flow_stat, unit, value, lower_ci, upper_ci) %>%
       mutate(across(everything(), as.character))
     
-    # Water year date conversions (for Day* metrics)
+    # date equivalents
     water_year_date_data <- formatted_predictions %>%
       filter(str_starts(flow_stat, "Day")) %>%
       mutate(
-        #flow_stat,
         unit = "date (water year)",
         value = as.character(day_to_date(round(prediction))),
         lower_ci = as.character(day_to_date(round(lower_95ci))),
@@ -684,7 +896,24 @@ server <- function(input, output, session) {
       select(flow_stat, unit, value, lower_ci, upper_ci) %>%
       mutate(across(everything(), as.character))
     
-    # Combine all data
+    # Additional data - include Monsoon and Bankfull with no conversion
+    other_data <- formatted_predictions %>%
+      filter(flow_stat %in% c("Monsoon", "Bankfull")) %>%
+      mutate(
+        value = if_else(flow_stat == "Monsoon", 
+                        round(prediction, 3), 
+                        round(prediction, 3)),
+        lower_ci = if_else(flow_stat == "Monsoon", 
+                           round(lower_95ci, 3), 
+                           round(lower_95ci, 3)),
+        upper_ci = if_else(flow_stat == "Monsoon", 
+                           round(upper_95ci, 3), 
+                           round(upper_95ci, 3))
+      ) %>%
+      select(flow_stat, unit, value, lower_ci, upper_ci) %>%
+      mutate(across(everything(), as.character))
+    
+    # watershed attributes
     pretty_ws_vars <- ws_vars %>%
       select(ws_area_sqkm, rckdepws_streamcat:impervious_percent, road_density_km_per_km2:avg_tot_pet) %>%
       st_drop_geometry() %>%
@@ -694,8 +923,7 @@ server <- function(input, output, session) {
       left_join(metadata %>% select(variable, units, description, source), by = "variable") %>%
       select(variable, value, units, description, source)
     
-    formatted_predictions <- bind_rows(mm_data, cfs_data, doy_data, water_year_date_data) %>%
-      # Create ordering for flow_stat within each unit type
+    final_preds <- bind_rows(mm_data, cfs_data, doy_data, water_year_date_data, other_data) %>%
       mutate(
         flow_stat_order = case_when(
           flow_stat %in% desired_order ~ match(flow_stat, desired_order),
@@ -703,57 +931,30 @@ server <- function(input, output, session) {
         )
       ) %>%
       arrange(flow_stat_order, unit) %>%
-      select(-flow_stat_order) %>%
-      bind_rows()
+      select(-flow_stat_order)
     
-    watershed_data(formatted_predictions)
+    watershed_data(final_preds)
     watershed_attributes(pretty_ws_vars)
-    message("Model predictions completed")
     
-    # Close progress modal and show completion notification
     removeModal()
-    showNotification("Analysis complete! You can now download the flow statistics.", 
-                     duration = 5, type = "message")
+    showNotification("Analysis complete! You can now download the flow statistics.", duration = 5, type = "message")
     
-    message("Watershed processing complete!")
-    
-    # Final cleanup
-    rm(ws_vars, all_predictions, formatted_predictions)
-    gc()
-  })
+    rm(ws_vars, all_predictions, formatted_predictions, final_preds); gc()
+  }
   
+  # --- Download functionality ---
   output$download_watershed_data <- downloadHandler(
-    filename = function() {
-      paste0("watershed_analysis_", Sys.Date(), ".xlsx")
-    },
+    filename = function() paste0("watershed_analysis_", Sys.Date(), ".xlsx"),
     content = function(file) {
-      # Create a new workbook
+      req(watershed_data(), watershed_attributes())
       wb <- createWorkbook()
-      
-      # Add the flow statistics sheet
       addWorksheet(wb, "flow_statistics")
       writeData(wb, "flow_statistics", watershed_data())
-      
-      # Add the watershed attributes sheet
       addWorksheet(wb, "watershed_attributes")
       writeData(wb, "watershed_attributes", watershed_attributes())
-      
-      # Save the workbook
       saveWorkbook(wb, file, overwrite = TRUE)
     }
   )
-  
-  observeEvent(input$clear_btn, {
-    click_point(NULL)
-    watershed_data(NULL)
-    watershed_attributes(NULL)
-    delineated_watershed(NULL)  # Clear the stored watershed
-    watershed_area(NULL)  # Clear stored area
-    leafletProxy("map") %>%
-      clearGroup("watershed") %>%
-      clearGroup("click_point") %>%
-      clearGroup("flowlines")
-  })
 }
 
 shinyApp(ui = ui, server = server)
