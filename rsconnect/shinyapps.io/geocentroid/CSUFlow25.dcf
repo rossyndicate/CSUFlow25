@@ -4,8 +4,8 @@ username: geocentroid
 account: geocentroid
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
-appId: 15001256
-bundleId: 10548797
+appId: 15165574
+bundleId: 11802114
 url: https://geocentroid.shinyapps.io/CSUFlow25/
 version: 1
 asMultiple: FALSE

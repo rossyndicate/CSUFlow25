@@ -118,9 +118,15 @@ convert_to_cfs <- function(mm_value, area_sqkm, unit_type, flow_stat = NULL) {
 }
 
 # Day-of-water-year -> date converter (WY starting Oct 1, using 2023-10-01 ref)
+# day_to_date <- function(day_of_wy) {
+#   start_date <- as.Date("2023-10-01")
+#   return(start_date + day_of_wy - 1)
+# }
+
 day_to_date <- function(day_of_wy) {
   start_date <- as.Date("2023-10-01")
-  return(start_date + day_of_wy - 1)
+  date <- start_date + day_of_wy - 1
+  return(format(date, "%B %d"))
 }
 
 ui <- page_fluid(
@@ -803,7 +809,7 @@ server <- function(input, output, session) {
     ws_vars <- ws_vars %>% left_join(climate_temp, by = "index")
     rm(climate_temp); gc()
     
-    ws_vars <- ws_vars %>% rename_all(tolower)
+    ws_vars <- ws_vars %>% st_drop_geometry() %>% rename_all(tolower)
     message("All variables processed successfully"); gc()
     
     # Models
@@ -888,7 +894,7 @@ server <- function(input, output, session) {
     water_year_date_data <- formatted_predictions %>%
       filter(str_starts(flow_stat, "Day")) %>%
       mutate(
-        unit = "date (water year)",
+        unit = "date",
         value = as.character(day_to_date(round(prediction))),
         lower_ci = as.character(day_to_date(round(lower_95ci))),
         upper_ci = as.character(day_to_date(round(upper_95ci)))
@@ -915,10 +921,11 @@ server <- function(input, output, session) {
     
     # watershed attributes
     pretty_ws_vars <- ws_vars %>%
-      select(ws_area_sqkm, rckdepws_streamcat:impervious_percent, road_density_km_per_km2:avg_tot_pet) %>%
       st_drop_geometry() %>%
+      select(ws_area_sqkm, rckdepws_streamcat:impervious_percent, road_density_km_per_km2:avg_tot_pet) %>%
+      select(-wsareasqkm_streamcat) %>%
       mutate(across(everything(), as.character)) %>%
-      select(-geometry.y) %>%
+      select(where(~ !is.list(.))) %>%  
       pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
       left_join(metadata %>% select(variable, units, description, source), by = "variable") %>%
       select(variable, value, units, description, source)
