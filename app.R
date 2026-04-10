@@ -232,6 +232,23 @@ ui <- page_fluid(
         htmlOutput("watershed_confirmation_html")
       )
     )
+  ),
+  
+  tags$footer(
+    style = "
+      text-align: center;
+      padding: 10px;
+      margin-top: 20px;
+      font-size: 12px;
+      color: #666;
+      border-top: 1px solid #ddd;
+    ",
+    tags$a(
+      href = "https://gis.colostate.edu/",
+      target = "_blank",
+      style = "color: #666; text-decoration: none;",
+      "Hosted by Colorado State University's Geospatial Centroid"
+    )
   )
 )
 
