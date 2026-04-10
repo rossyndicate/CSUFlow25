@@ -4,7 +4,7 @@ CSUFlow25 is a Shiny app for predicting streamflow metrics for ungaged watershed
 
 The app estimates annual, monthly, low-flow, high-flow, timing, and bankfull metrics using watershed predictors such as topography, snow, climate, land cover, soils, geology, dams, roads, hydrologic region, and PET.
 
-This app is hosted online by the Colorado State University Geopsatial Centroid [here](https://geocentroid.shinyapps.io/CSUFlow25/){.uri}.
+This app is hosted online by the Colorado State University Geospatial Centroid [here](https://geocentroid.shinyapps.io/CSUFlow25/){.uri}.
 
 The associated report can be accessed HERE (... eventually. The home for this report still pending).
 
