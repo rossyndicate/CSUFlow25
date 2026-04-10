@@ -1,14 +1,12 @@
 road_density_grabber <- function(watersheds){
   
   all_roads <- readRDS("data/TIGER_roads.RDS") 
+  
   if(crs(all_roads) != crs(watersheds)){
-    all_roads <- all_roads %>% st_transform(crs(watersheds))
+    watersheds <- watersheds %>% st_transform(crs(all_roads))
   }
   
   all_roads <- all_roads %>%
-    as.data.table() %>%
-    distinct() %>%
-    st_as_sf() %>%
     .[watersheds,]
   
   road_lengths <- vector("list", length = nrow(watersheds))
