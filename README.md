@@ -32,7 +32,7 @@ Notes:
 
 -   `app.R`: main Shiny application
 -   `src/`: helper functions for watershed variable extraction
--   `data/`: preprocessed rasters, model files, road/fire/geology layers, and metadata
+-   `data/`: preprocessed rasters, model files, road/fire/geology layers, and metadata. For access, contact *kathryn dot willi at colostate dot edu*.
 -   `temp_data/`: temporary files created while the app runs
 
 ## Inputs and outputs
